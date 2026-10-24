@@ -14,12 +14,7 @@
     RightShift — показать / скрыть меню (на телефоне — кнопка «–» в заголовке)
 ]]
 
-local VERSION = "1.1"
-
--- если скрипт запущен повторно — сначала выгружаем старую копию
-if _G.BFVisualsUnload then
-    _G.BFVisualsUnload()
-end
+local VERSION = "1.2"
 
 local Players = game:GetService("Players")
 local Lighting = game:GetService("Lighting")
@@ -27,6 +22,23 @@ local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 
 local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+-- Если скрипт запущен повторно — сначала выгружаем старую копию.
+-- В экзекуторах _G бывает своим у каждого запуска, поэтому храним
+-- выгрузку в getgenv(), а старое меню на всякий случай ищем по имени.
+local sharedEnv = (getgenv and getgenv()) or _G
+for _, env in ipairs({ sharedEnv, _G }) do
+    if env.BFVisualsUnload then
+        pcall(env.BFVisualsUnload)
+        env.BFVisualsUnload = nil
+    end
+end
+for _, old in ipairs(playerGui:GetChildren()) do
+    if old.Name == "BFVisuals" then
+        old:Destroy()
+    end
+end
 
 local running = true
 local connections = {}
@@ -361,11 +373,13 @@ local gui = Instance.new("ScreenGui")
 gui.Name = "BFVisuals"
 gui.ResetOnSpawn = false
 gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-gui.Parent = player:WaitForChild("PlayerGui")
+gui.DisplayOrder = 100 -- поверх интерфейса игры
+gui.Parent = playerGui
 
 local main = Instance.new("Frame")
 main.Name = "Main"
-main.Position = UDim2.fromOffset(40, 120)
+main.AnchorPoint = Vector2.new(0.5, 0)
+main.Position = UDim2.new(0.5, 0, 0.2, 0)
 main.Size = UDim2.fromOffset(240, 0)
 main.AutomaticSize = Enum.AutomaticSize.Y
 main.BackgroundColor3 = COLORS.background
@@ -479,9 +493,9 @@ local function unload()
         workspace.CurrentCamera.FieldOfView = originalFOV
     end
     gui:Destroy()
-    _G.BFVisualsUnload = nil
+    sharedEnv.BFVisualsUnload = nil
 end
-_G.BFVisualsUnload = unload
+sharedEnv.BFVisualsUnload = unload
 
 ---------------------------------------------------------------------
 -- Элементы меню
@@ -632,3 +646,5 @@ local unloadButton = makeButton("Выгрузить скрипт", COLORS.danger
 connect(unloadButton.MouseButton1Click, unload)
 
 makeHint("RightShift — скрыть / показать меню")
+
+print("[BF Visuals] v" .. VERSION .. " загружен")

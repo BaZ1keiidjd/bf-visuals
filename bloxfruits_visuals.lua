@@ -14,6 +14,8 @@
     RightShift — показать / скрыть меню (на телефоне — кнопка «–» в заголовке)
 ]]
 
+local VERSION = "1.1"
+
 -- если скрипт запущен повторно — сначала выгружаем старую копию
 if _G.BFVisualsUnload then
     _G.BFVisualsUnload()
@@ -83,29 +85,104 @@ end
 
 ---------------------------------------------------------------------
 -- Без тумана
+-- Игра может делать туман тремя способами: обычный туман Lighting,
+-- объект Atmosphere или полупрозрачные «туманные» детали — убираем все.
 ---------------------------------------------------------------------
 local fogSaved
+local hiddenAtmospheres = {} -- Atmosphere, вынутые из Lighting
+local hiddenFogParts = setmetatable({}, { __mode = "k" }) -- [деталь] = исходный LocalTransparencyModifier
+
+local function hideFogPart(obj)
+    if not obj:IsA("BasePart") or obj.Transparency <= 0 or hiddenFogParts[obj] then
+        return false
+    end
+    local name = string.lower(obj.Name)
+    if not (string.find(name, "fog", 1, true) or string.find(name, "mist", 1, true)) then
+        return false
+    end
+    hiddenFogParts[obj] = obj.LocalTransparencyModifier
+    obj.LocalTransparencyModifier = 1
+    return true
+end
+
+-- вызывается каждый кадр, пока включено
+local function applyNoFog()
+    if Lighting.FogEnd < 1e9 then
+        Lighting.FogEnd = 9e9
+    end
+    -- Atmosphere работает только внутри Lighting. Если просто менять ей Density,
+    -- игра перезаписывает значение обратно, поэтому вынимаем её целиком
+    for _, child in ipairs(Lighting:GetChildren()) do
+        if child:IsA("Atmosphere") then
+            table.insert(hiddenAtmospheres, child)
+            child.Parent = nil
+        end
+    end
+end
+
+-- отчёт в консоль (F9) — пригодится, если туман всё равно остался
+local function printFogReport(foundParts)
+    local children = {}
+    for _, child in ipairs(Lighting:GetChildren()) do
+        table.insert(children, child.Name .. " (" .. child.ClassName .. ")")
+    end
+    print(string.format(
+        "[BF Visuals] Без тумана: FogEnd был %.0f, убрано Atmosphere: %d, скрыто туманных деталей: %d",
+        fogSaved.FogEnd, #hiddenAtmospheres, foundParts
+    ))
+    print("[BF Visuals] Lighting: " .. table.concat(children, ", "))
+end
 
 local function setNoFog(on)
     state.noFog = on
     if on then
-        fogSaved = {
-            FogStart = Lighting.FogStart,
-            FogEnd = Lighting.FogEnd,
-            atmospheres = {}, -- заполняется в цикле рендера
-        }
-    elseif fogSaved then
-        Lighting.FogStart = fogSaved.FogStart
-        Lighting.FogEnd = fogSaved.FogEnd
-        for atmosphere, saved in pairs(fogSaved.atmospheres) do
-            if atmosphere.Parent then
-                atmosphere.Density = saved.Density
-                atmosphere.Haze = saved.Haze
+        fogSaved = { FogEnd = Lighting.FogEnd }
+        applyNoFog()
+        -- ищем туманные детали по всей карте порциями, чтобы не было фриза
+        task.spawn(function()
+            local found = 0
+            for i, obj in ipairs(workspace:GetDescendants()) do
+                if not state.noFog then
+                    return
+                end
+                if hideFogPart(obj) then
+                    found = found + 1
+                end
+                if i % 2000 == 0 then
+                    task.wait()
+                end
             end
+            if state.noFog then
+                printFogReport(found)
+            end
+        end)
+    elseif fogSaved then
+        Lighting.FogEnd = fogSaved.FogEnd
+        for _, atmosphere in ipairs(hiddenAtmospheres) do
+            atmosphere.Parent = Lighting
         end
+        table.clear(hiddenAtmospheres)
+        for part, modifier in pairs(hiddenFogParts) do
+            part.LocalTransparencyModifier = modifier
+        end
+        table.clear(hiddenFogParts)
         fogSaved = nil
     end
 end
+
+-- если игра меняет туман посреди кадра — сразу возвращаем
+connect(Lighting:GetPropertyChangedSignal("FogEnd"), function()
+    if state.noFog then
+        applyNoFog()
+    end
+end)
+
+-- туманные детали, которые появляются позже (ивенты, погода)
+connect(workspace.DescendantAdded, function(obj)
+    if state.noFog then
+        hideFogPart(obj)
+    end
+end)
 
 ---------------------------------------------------------------------
 -- Время суток
@@ -233,9 +310,12 @@ end
 
 ---------------------------------------------------------------------
 -- Каждый кадр поддерживаем выбранные настройки
--- (игра сама меняет освещение — день/ночь, острова)
+-- (игра сама меняет освещение — день/ночь, острова, ивенты).
+-- Применяем в самом конце рендер-шага, чтобы перебить скрипты игры.
 ---------------------------------------------------------------------
-connect(RunService.RenderStepped, function()
+local RENDER_STEP_NAME = "BFVisuals"
+
+local function enforce()
     if state.fullbright then
         Lighting.Brightness = 2
         Lighting.Ambient = Color3.fromRGB(180, 180, 180)
@@ -245,17 +325,7 @@ connect(RunService.RenderStepped, function()
         Lighting.GlobalShadows = false
     end
     if state.noFog then
-        Lighting.FogStart = 0
-        Lighting.FogEnd = 100000
-        for _, child in ipairs(Lighting:GetChildren()) do
-            if child:IsA("Atmosphere") then
-                if not fogSaved.atmospheres[child] then
-                    fogSaved.atmospheres[child] = { Density = child.Density, Haze = child.Haze }
-                end
-                child.Density = 0
-                child.Haze = 0
-            end
-        end
+        applyNoFog()
     end
     if state.clockTime then
         Lighting.ClockTime = state.clockTime
@@ -263,7 +333,10 @@ connect(RunService.RenderStepped, function()
     if state.fov then
         workspace.CurrentCamera.FieldOfView = state.fov
     end
-end)
+end
+
+connect(RunService.RenderStepped, enforce)
+RunService:BindToRenderStep(RENDER_STEP_NAME, Enum.RenderPriority.Last.Value + 1, enforce)
 
 ---------------------------------------------------------------------
 -- Интерфейс
@@ -311,10 +384,10 @@ header.BackgroundColor3 = COLORS.header
 header.BorderSizePixel = 0
 header.Active = true
 header.Font = Enum.Font.GothamBold
-header.TextSize = 15
+header.TextSize = 14
 header.TextColor3 = COLORS.text
 header.TextXAlignment = Enum.TextXAlignment.Left
-header.Text = "  Blox Fruits Visuals"
+header.Text = "  Blox Fruits Visuals v" .. VERSION
 header.Parent = main
 corner(header, 8)
 
@@ -401,6 +474,7 @@ local function unload()
     for _, conn in ipairs(connections) do
         conn:Disconnect()
     end
+    RunService:UnbindFromRenderStep(RENDER_STEP_NAME)
     if state.fov then
         workspace.CurrentCamera.FieldOfView = originalFOV
     end

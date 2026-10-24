@@ -6,6 +6,7 @@
     Функции:
       • Fullbright   — светло даже ночью и в пещерах
       • Без тумана   — убирает туман и дымку (Atmosphere)
+      • Без тошноты  — убирает размытие, затемнение и качку камеры (6 зона моря)
       • Время суток  — фиксирует утро / день / закат / ночь
       • Шейдеры      — пресеты цветокоррекции, bloom, лучи солнца
       • FOV          — угол обзора камеры
@@ -14,7 +15,7 @@
     RightShift — показать / скрыть меню (на телефоне — кнопка «–» в заголовке)
 ]]
 
-local VERSION = "1.2"
+local VERSION = "1.3"
 
 local Players = game:GetService("Players")
 local Lighting = game:GetService("Lighting")
@@ -69,6 +70,7 @@ local state = {
     clockTime = nil, -- nil = время как в игре
     fov = nil,       -- nil = FOV не трогаем
     fpsBoost = false,
+    noScreenFx = false,
 }
 
 local originalFOV = workspace.CurrentCamera.FieldOfView
@@ -321,6 +323,112 @@ local function enableFpsBoost()
 end
 
 ---------------------------------------------------------------------
+-- Без тошноты и затемнения (например, в 6 зоне моря)
+-- Игра размывает и затемняет картинку эффектами постобработки, качает
+-- камеру и может накрывать экран тёмным слоем интерфейса — убираем это.
+-- Выключение кнопки просто перестаёт мешать игре, назад ничего не включаем,
+-- чтобы затемнение не «залипло» после выхода из зоны.
+---------------------------------------------------------------------
+local OVERLAY_WORDS = { "vignette", "blur", "dark", "nausea", "dizz", "drunk", "sick", "poison" }
+
+local disabledFx = setmetatable({}, { __mode = "k" })     -- эффекты, которые держим выключенными
+local hiddenOverlays = setmetatable({}, { __mode = "k" }) -- тёмные слои интерфейса
+local reported = setmetatable({}, { __mode = "k" })       -- что уже написали в консоль
+
+local function report(obj, what)
+    if not reported[obj] then
+        reported[obj] = true
+        print("[BF Visuals] " .. what .. ": " .. obj:GetFullName() .. " (" .. obj.ClassName .. ")")
+    end
+end
+
+-- размытие убираем всегда, цветокоррекцию — только если она темнит, обесцвечивает или красит экран
+local function spoilsPicture(effect)
+    if effect:IsA("BlurEffect") or effect:IsA("DepthOfFieldEffect") then
+        return true
+    end
+    if effect:IsA("ColorCorrectionEffect") then
+        local tint = effect.TintColor
+        return effect.Brightness < 0 or effect.Saturation < 0 or math.min(tint.R, tint.G, tint.B) < 0.9
+    end
+    return false
+end
+
+-- вызывается каждый кадр, пока включено
+local function applyNoScreenFx()
+    local camera = workspace.CurrentCamera
+    for _, container in ipairs({ Lighting, camera }) do
+        for _, effect in ipairs(container:GetChildren()) do
+            if effect:IsA("PostEffect") and effect.Name ~= "BFVisuals" and effect.Enabled
+                and (disabledFx[effect] or spoilsPicture(effect)) then
+                disabledFx[effect] = true
+                effect.Enabled = false
+                report(effect, "убран эффект")
+            end
+        end
+    end
+    if Lighting.ExposureCompensation < 0 then
+        Lighting.ExposureCompensation = 0
+    end
+    for overlay in pairs(hiddenOverlays) do
+        overlay.Visible = false
+    end
+    -- качка: убираем наклон камеры и держим FOV ровным
+    local cf = camera.CFrame
+    if math.abs(cf.LookVector.Y) < 0.99 then
+        camera.CFrame = CFrame.lookAt(cf.Position, cf.Position + cf.LookVector)
+    end
+    camera.FieldOfView = state.fov or originalFOV
+end
+
+-- ищем полноэкранные тёмные слои интерфейса
+local function scanOverlays()
+    local screen = workspace.CurrentCamera.ViewportSize
+    for _, obj in ipairs(playerGui:GetDescendants()) do
+        if (obj:IsA("Frame") or obj:IsA("ImageLabel")) and obj.Visible
+            and not hiddenOverlays[obj] and not obj:FindFirstAncestor("BFVisuals") then
+            local size = obj.AbsoluteSize
+            local drawn = obj.BackgroundTransparency < 1
+                or (obj:IsA("ImageLabel") and obj.Image ~= "" and obj.ImageTransparency < 1)
+            if drawn and size.X >= screen.X * 0.9 and size.Y >= screen.Y * 0.9 then
+                local name = string.lower(obj.Name)
+                local matched = false
+                for _, word in ipairs(OVERLAY_WORDS) do
+                    if string.find(name, word, 1, true) then
+                        matched = true
+                        break
+                    end
+                end
+                if matched then
+                    hiddenOverlays[obj] = true
+                    report(obj, "скрыт тёмный слой")
+                else
+                    report(obj, "полноэкранный слой (не тронут)")
+                end
+            end
+        end
+    end
+end
+
+local function setNoScreenFx(on)
+    state.noScreenFx = on
+    if not on then
+        table.clear(disabledFx)
+        table.clear(hiddenOverlays)
+    end
+end
+
+-- интерфейс у игры большой, поэтому проверяем его раз в 2 секунды, а не каждый кадр
+task.spawn(function()
+    while running do
+        if state.noScreenFx then
+            pcall(scanOverlays)
+        end
+        task.wait(2)
+    end
+end)
+
+---------------------------------------------------------------------
 -- Каждый кадр поддерживаем выбранные настройки
 -- (игра сама меняет освещение — день/ночь, острова, ивенты).
 -- Применяем в самом конце рендер-шага, чтобы перебить скрипты игры.
@@ -344,6 +452,9 @@ local function enforce()
     end
     if state.fov then
         workspace.CurrentCamera.FieldOfView = state.fov
+    end
+    if state.noScreenFx then
+        applyNoScreenFx()
     end
 end
 
@@ -629,6 +740,7 @@ end
 
 makeToggle("Fullbright", setFullbright)
 makeToggle("Без тумана", setNoFog)
+makeToggle("Без тошноты/затемнения", setNoScreenFx)
 makeCycle("Время", timeOptions, setTime)
 makeCycle("Шейдеры", shaderPresets, applyShader)
 makeSlider("FOV", 50, 120, math.clamp(math.floor(originalFOV + 0.5), 50, 120), function(value)
